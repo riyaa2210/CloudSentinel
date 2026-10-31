@@ -11,3 +11,10 @@ def test_health():
     data = response.json()
     assert data["status"] == "ok"
     assert data["service"] == "sentinel"
+
+
+def test_health_reports_database():
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["database"] == "ok"

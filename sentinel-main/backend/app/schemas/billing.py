@@ -9,7 +9,6 @@ class BillingCreate(BaseModel):
     timestamp: datetime
     region: str
     account_id: str
-    is_anomaly: bool = False
 
 
 class BillingBatchCreate(BaseModel):
@@ -32,19 +31,8 @@ class BillingResponse(BaseModel):
 class SeedResponse(BaseModel):
     message: str
     records_created: int
+    seed_used: int | None = None
 
 class BillingSummary(BaseModel):
     service: str
     total_cost: float
-
-
-class AnomalyResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    service: str
-    cost: float
-    timestamp: datetime
-    region: str
-    account_id: str
-    z_score: float

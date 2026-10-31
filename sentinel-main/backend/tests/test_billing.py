@@ -47,7 +47,9 @@ def test_anomalies():
     data = response.json()
     for record in data:
         assert "z_score" in record
-        assert abs(record["z_score"]) > 2.0
+        # Records are returned when their true |z| exceeds the threshold (2.0).
+        # z_score is rounded to 3 decimals, so the rounded value is >= threshold.
+        assert abs(record["z_score"]) >= 2.0
 
 
 def test_anomaly_threshold():
@@ -57,3 +59,17 @@ def test_anomaly_threshold():
     assert r2.status_code == 200
     assert r10.status_code == 200
     assert len(r10.json()) <= len(r2.json())
+
+
+def test_seed_deterministic():
+    """Same seed + replace must yield identical cost/service/region/account data."""
+    client.post("/api/v1/billing/seed?days=2&seed=42&replace=true")
+    r1 = client.get("/api/v1/billing/")
+    client.post("/api/v1/billing/seed?days=2&seed=42&replace=true")
+    r2 = client.get("/api/v1/billing/")
+
+    def signature(records):
+        return [(x["service"], x["cost"], x["region"], x["account_id"]) for x in records]
+
+    assert len(r1.json()) == len(r2.json())
+    assert signature(r1.json()) == signature(r2.json())

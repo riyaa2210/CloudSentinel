@@ -1,0 +1,15 @@
+[tool.ruff]
+# The app runs on Python 3.12 in Docker/CI; 3.10 is the lowest version it has
+# been verified on, so keep ruff from suggesting 3.11+ idioms (e.g. datetime.UTC)
+# that would break older interpreters.
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Stable default rule set. Explicitly selected so lint results do not change
+# when ruff ships new rule categories (e.g. UP/pyupgrade, BLE/blind-except).
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Health checks legitimately catch any exception to report degraded status.
+"app/main.py" = ["E722"]

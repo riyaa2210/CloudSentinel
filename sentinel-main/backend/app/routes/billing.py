@@ -1,32 +1,41 @@
-import statistics
-from collections import defaultdict
+import logging
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.database import get_db
+from app.models.anomaly import AnomalyEvent
 from app.models.billing import BillingRecord
+from app.schemas.anomaly import AnomalyResponse
 from app.schemas.billing import (
-    AnomalyResponse,
     BillingBatchCreate,
     BillingCreate,
     BillingResponse,
-    SeedResponse,
     BillingSummary,
+    SeedResponse,
 )
+from app.services.detection import detect_anomalies
 from app.services.mock_data import generate_mock_records
 
+logger = logging.getLogger("sentinel.billing")
 router = APIRouter(prefix="/api/v1/billing", tags=["billing"])
 
 
 @router.post("/", response_model=BillingResponse, status_code=201)
 def ingest_single(record: BillingCreate, db: Session = Depends(get_db)):
-    """Ingest a single billing record."""
+    """Ingest a single billing record. is_anomaly is system-derived, not client-set."""
     db_record = BillingRecord(**record.model_dump())
     db.add(db_record)
     db.commit()
     db.refresh(db_record)
+    logger.info(
+        "ingested record id=%s service=%s cost=%.2f",
+        db_record.id,
+        db_record.service,
+        db_record.cost,
+    )
     return db_record
 
 
@@ -38,22 +47,40 @@ def ingest_batch(batch: BillingBatchCreate, db: Session = Depends(get_db)):
     db.commit()
     for r in db_records:
         db.refresh(r)
+    logger.info("ingested batch of %s records", len(db_records))
     return db_records
 
 
 @router.post("/seed", response_model=SeedResponse, status_code=201)
 def seed_mock_data(
     days: int = Query(default=30, ge=1, le=365),
+    seed: int | None = Query(default=None, description="RNG seed for deterministic data"),
+    replace: bool = Query(
+        default=False, description="Delete existing records before seeding"
+    ),
     db: Session = Depends(get_db),
 ):
-    """Generate and ingest realistic mock AWS billing data."""
-    records = generate_mock_records(days=days)
+    """Generate and ingest realistic mock billing data.
+
+    Pass a ``seed`` for a reproducible dataset (handy for demos and tests).
+    Set ``replace=true`` to clear existing records first.
+    """
+    if replace:
+        deleted = db.query(BillingRecord).delete()
+        db.commit()
+        logger.info("seed: cleared %s existing records", deleted)
+    records = generate_mock_records(days=days, seed=seed)
     db.add_all(records)
     db.commit()
+    logger.info(
+        "seed: created %s records (days=%s, seed=%s)", len(records), days, seed
+    )
     return SeedResponse(
         message=f"Seeded {len(records)} billing records over {days} days",
         records_created=len(records),
+        seed_used=seed,
     )
+
 
 @router.get('/', response_model=list[BillingResponse])
 def get_billing(
@@ -69,49 +96,114 @@ def get_billing(
     records = stmt.all()
     return records
 
+
 @router.get('/summary', response_model=list[BillingSummary])
 def get_summary(
         db: Session = Depends(get_db)
 ):
-    total_cost = db.query(BillingRecord.service, func.sum(BillingRecord.cost).label("total_cost")).group_by(BillingRecord.service)
-    billing_data = [BillingSummary(service=row.service, total_cost=row.total_cost) for row in total_cost]
+    total_cost = (
+        db.query(BillingRecord.service, func.sum(BillingRecord.cost).label("total_cost"))
+        .group_by(BillingRecord.service)
+    )
+    billing_data = [
+        BillingSummary(service=row.service, total_cost=row.total_cost)
+        for row in total_cost
+    ]
     return billing_data
+
 
 @router.get('/anomalies', response_model=list[AnomalyResponse])
 def get_anomalies(
-        threshold: float = Query(default=2.0, ge=0),
+        threshold: float | None = Query(default=None, ge=0),
+        window: int | None = Query(default=None, ge=1),
+        min_observations: int | None = Query(default=None, ge=1),
         db: Session = Depends(get_db),
 ):
-    """Return billing records with |z-score| > threshold, grouped by service."""
-    records = db.query(BillingRecord).all()
+    """Detect anomalies against a rolling per-service baseline.
 
-    grouped = defaultdict(list)
-    for r in records:
-        grouped[r.service].append(r)
+    Each candidate is compared to the previous ``window`` observations of the
+    same service (candidate excluded), so a spike never inflates its own
+    baseline. Findings are persisted as AnomalyEvents with de-duplication: an
+    already-alerted record is not re-alerted. ``threshold``, ``window`` and
+    ``min_observations`` default to configured values.
+    """
+    settings = get_settings()
+    effective_threshold = (
+        threshold if threshold is not None else settings.anomaly_z_score_threshold
+    )
+    effective_window = (
+        window if window is not None else settings.anomaly_detection_window
+    )
+    effective_min = (
+        min_observations
+        if min_observations is not None
+        else settings.anomaly_min_observations
+    )
+
+    records = db.query(BillingRecord).all()
+    findings, insufficient = detect_anomalies(
+        records,
+        window=effective_window,
+        min_observations=effective_min,
+        threshold=effective_threshold,
+    )
 
     anomalies = []
-    for service, group in grouped.items():
-        if len(group) < 2:
-            continue
-        costs = [r.cost for r in group]
-        mean = statistics.mean(costs)
-        std = statistics.stdev(costs)
-        if std == 0:
-            continue
-        for r in group:
-            z = (r.cost - mean) / std
-            if abs(z) > threshold:
-                anomalies.append(AnomalyResponse(
-                    id=r.id,
-                    service=r.service,
-                    cost=r.cost,
-                    timestamp=r.timestamp,
-                    region=r.region,
-                    account_id=r.account_id,
-                    z_score=round(z, 3),
-                ))
+    for f in findings:
+        event = (
+            db.query(AnomalyEvent)
+            .filter(AnomalyEvent.billing_record_id == f.record_id)
+            .first()
+        )
+        if event is None:
+            event = AnomalyEvent(
+                billing_record_id=f.record_id,
+                service=f.service,
+                observed_cost=f.cost,
+                baseline_mean=f.baseline_mean,
+                baseline_std=f.baseline_std,
+                z_score=f.z_score,
+                threshold=f.threshold,
+                severity=f.severity,
+                detection_reason=f.detection_reason,
+                status="open",
+            )
+            db.add(event)
+            db.flush()  # populate event.id (and persist) without committing yet
+            rec = db.get(BillingRecord, f.record_id)
+            if rec is not None:
+                rec.is_anomaly = True
+            logger.warning(
+                "new anomaly: service=%s cost=%.2f z=%.2f severity=%s",
+                f.service, f.cost, f.z_score, f.severity,
+            )
+        anomalies.append(
+            AnomalyResponse(
+                id=f.record_id,
+                service=f.service,
+                cost=f.cost,
+                timestamp=f.timestamp,
+                region=f.region,
+                account_id=f.account_id,
+                z_score=round(f.z_score, 3),
+                baseline_mean=round(f.baseline_mean, 4),
+                baseline_std=round(f.baseline_std, 4),
+                threshold=f.threshold,
+                severity=f.severity,
+                detection_reason=f.detection_reason,
+                anomaly_event_id=event.id,
+            )
+        )
 
-    anomalies.sort(key=lambda a: abs(a.z_score), reverse=True)
+    db.commit()
+    logger.info(
+        "anomalies: %s found, %s insufficient (threshold=%.2f, window=%s, min_obs=%s)",
+        len(anomalies),
+        insufficient,
+        effective_threshold,
+        effective_window,
+        effective_min,
+    )
     return anomalies
 
 
